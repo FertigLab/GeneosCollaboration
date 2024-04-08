@@ -1,0 +1,378 @@
+---
+title: "Preprocessing"
+author: "Daniel Shu"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    keep_md: yes
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message =TRUE,
+                      warning =TRUE, cache= FALSE)
+```
+
+# I. Setup
+## a. Load libraries
+
+```{r libraries}
+library(Seurat)
+library(SeuratObject)
+library(sctransform)
+library(patchwork)
+library(Azimuth)
+library(SeuratData)
+library(ggplot2)
+library(tidyverse)
+library(glmGamPoi)
+library(tools)
+library(SeuratDisk)
+```
+
+## b.Preliminaries
+
+```{r settings}
+data.dir <- "./data" 
+
+list <- list.files(path=data.dir, pattern="tsv.gz|mtx.gz",recursive=TRUE,full.names =TRUE) 
+list <- list %>% str_replace_all(c("barcodes.tsv.gz" = "","features.tsv.gz"="","matrix.mtx.gz"="")) %>% unique 
+
+list.names <- list %>% str_replace("./data/","") %>% str_replace("/","")
+
+```
+
+# II. Load data 
+### a. Load data
+```{r load_seurat}
+seurat_list <- lapply(1:length(list),function(i) { 
+  tenx_data <- Read10X(data.dir = list[i])
+  temp <- CreateSeuratObject(counts = tenx_data, min.cells = 3, min.features = 200) #this creates the seurat objewct
+  temp$orig.ident=list.names[i] #this changes the orig.ident column so it contains the name of the sample
+  return(temp)
+})
+
+seurat <- merge(seurat_list[[1]], y=c(seurat_list[-1]), add.cell.ids=list.names,project="GENEOS")
+
+#add column for patient ID, which is identical to orig.ident except for the two samples where there is an A and B suffix
+seurat$Patient <- str_replace(seurat@meta.data$orig.ident, "A|B", "")
+
+# seurat <- readRDS("./output/seurat_before_preprocessing.rds")
+# saveRDS(seurat, file = "output/seurat_before_preprocessing.rds")
+```
+
+# III. Pre-processing
+### a. Plots for percent mito, nFeature
+```{r preprocessing}
+seurat <-PercentageFeatureSet(seurat, pattern = "^MT-", col.name = "percent.mt")
+
+# Use FeatureScatter is typically used to visualize feature-feature relationships, but can be used
+# for anything calculated by the object, i.e. columns in object metadata, PC scores etc.
+plot1 <- FeatureScatter(seurat, feature1 = "nCount_RNA", feature2 = "percent.mt", group.by='orig.ident')
+plot2 <- FeatureScatter(seurat, feature1 = "nCount_RNA", feature2 = "nFeature_RNA",group.by='orig.ident')
+plot1 + plot2
+
+# plot3 <- FeatureScatter(seurat, feature1 = "nCount_RNA", feature2 = "percent.ribo", group.by='orig.ident')
+# plot3
+
+# Visualize QC metrics as a violin plot
+vln1 <- VlnPlot(seurat, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"#,"percent.ribo"
+                                     ),ncol=3)
+vln1
+vln2 <- VlnPlot(seurat, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"#,"percent.ribo"
+                                     ),group.by = 'orig.ident',ncol=3)
+vln2
+
+seurat.subset <- subset(seurat, subset = nFeature_RNA > 200 & nFeature_RNA < 4000 & percent.mt < 25) 
+
+vln3 <- VlnPlot(seurat.subset, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+vln4 <- VlnPlot(seurat.subset, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),group.by = 'orig.ident') 
+vln3
+vln4
+
+pdf("output/qc_plots.pdf");plot1 + plot2;vln1;vln2;vln3;vln4;dev.off()
+```
+
+### b. Remove TRA/TRB genes to avoid clonotype bias
+Sundell et al. 2023 https://academic.oup.com/bfg/article/22/3/263/6874511
+
+```{r preprocessing}
+#subset to remove TRAV and TRBV genes as markers
+rownames(seurat.subset) %>% length
+grepl("^TR[AB][VJC]", rownames(seurat.subset)) %>% table
+seurat.subset <- seurat.subset[!grepl("^TR[AB][VJC]", rownames(seurat.subset)), ] #note I remove TRA TRB genes but not TRG or TRD
+rownames(seurat.subset) %>% length
+
+# seurat.subset <- readRDS("./output/seurat_subset.rds")
+saveRDS(seurat.subset, file = "output/seurat_subset.rds")
+
+# rm(seurat);rm(seurat_list);rm(plot1);rm(plot2);rm(list=ls(pattern="^vln"))
+```
+
+# IV. Normalize Data 
+## a. First Attempt wo batch correction
+### 1. Run SCTransform. 
+NOTE: I am not scaling the data based on this documentation, which says sctransform normalization replaces this function
+https://satijalab.org/seurat/articles/sctransform_vignette.html
+
+```{r normalize}
+seurat.subset.scT <- SCTransform(seurat.subset,
+                                        method="glmGamPoi",
+                                        vst.flavor="v2",
+                                        vars.to.regress = "percent.mt",
+                                 # return.only.var.genes = FALSE #this is set to false so scale.data matrix contains all genes, not just variable genes
+                                        )
+
+# save object that has been subset to and scTransformed. If needing to revise can reload this object rather than re-running the above
+#saveRDS(seurat.subset.scT, file = "output/seurat_subset_scT.rds")
+# seurat.subset.scT <- readRDS("./output/seurat_subset_scT.rds") 
+```
+
+### 2. Dimensionality reduction 
+This is an amalgamation of the seurat vignettes here (https://satijalab.org/seurat/articles/sctransform_vignette.html) and here (https://satijalab.org/seurat/articles/pbmc3k_tutorial.html)
+
+```{r dimensionality_reduction_find_clusters}
+seurat.subset.scT.dimReduction <- RunPCA(seurat.subset.scT)
+rm(seurat.subset.scT)
+
+VizDimLoadings(seurat.subset.scT.dimReduction, dims = 1:2, reduction = "pca")
+DimPlot(seurat.subset.scT.dimReduction, reduction = "pca")
+DimHeatmap(seurat.subset.scT.dimReduction, dims = 1, cells = 500, balanced = TRUE)
+DimHeatmap(seurat.subset.scT.dimReduction, dims = 1:15, cells = 500, balanced = TRUE)
+ElbowPlot(seurat.subset.scT.dimReduction)
+
+pdf("output/dimreduction_plots.pdf")
+VizDimLoadings(seurat.subset.scT.dimReduction, dims = 1:2, reduction = "pca")
+DimPlot(seurat.subset.scT.dimReduction, reduction = "pca")
+DimHeatmap(seurat.subset.scT.dimReduction, dims = 1, cells = 500, balanced = TRUE)
+DimHeatmap(seurat.subset.scT.dimReduction, dims = 1:15, cells = 500, balanced = TRUE)
+ElbowPlot(seurat.subset.scT.dimReduction)
+dev.off()
+
+seurat.subset.scT.dimReduction <- FindNeighbors(seurat.subset.scT.dimReduction, reduction="pca", dims = 1:15)
+
+#saveRDS(seurat.subset.scT.dimReduction, file = "output/seurat_pre_FindClusters.rds")
+# seurat.subset.scT.dimReduction <- readRDS("output/seurat_pre_FindClusters.rds")
+```
+
+### 3. Find clusters
+
+```{r find_clusters}
+seurat.final <- FindClusters(object = seurat.subset.scT.dimReduction, resolution = 0.7)
+head(Idents(seurat.final), 5)
+seurat.final <- RunUMAP(seurat.final, reduction="pca", dims=1:15) 
+
+#Visualize with UMAP
+p1<- DimPlot(seurat.final, reduction = "umap")
+p1
+p2 <- DimPlot(seurat.final, repel =TRUE, split.by="orig.ident", ncol=3)
+p2
+p3 <- DimPlot(seurat.final, repel =TRUE, group.by="orig.ident")
+p3
+p2/p3
+pdf("output/find_clusters.pdf");p1;p2;p3;p2/p3;dev.off();rm(p1);rm(p2);rm(p3)
+
+saveRDS(seurat.final, file = "output/seurat_final.rds")
+# seurat.final <- readRDS("./output/seurat_final.rds")
+# rm(list=ls(pattern="^seurat.subset"))
+```
+
+# V. Normalize Data + batch correction
+
+In section IV.1, I determined that there was significant batch effect between sample 8A and 8B vs 6 and 7, so here I am adding batch correction
+
+```{r}
+# seurat.subset <- readRDS("./output/seurat_subset.rds")
+
+# now will integrate following this tutorial (https://satijalab.org/seurat/articles/integration_introduction.html)
+# note this comes from the bottom of the page, where they demonstrate integration for datasets using scTransform normalization
+# so i will go back to the output of section III (after QC to remove cells with high mitochondrial content) and split that object, seurat.subset, which is analogous to "ifnb" in the seurat vignette
+
+
+#  I went to a reference-based integration by orig.ident (see FindIntegrationAnchors below)
+#note I use ifnb object names since this code is copied from the vignette
+obj.list <- SplitObject(seurat.subset, split.by = "orig.ident")
+obj.list <- lapply(X = obj.list, FUN = SCTransform, method = "glmGamPoi",vst.flavor="v2",vars.to.regress = "percent.mt")
+features <- SelectIntegrationFeatures(object.list = obj.list, nfeatures = 3000)
+obj.list <- PrepSCTIntegration(object.list = obj.list, anchor.features = features)
+obj.list <- lapply(X = obj.list, FUN = RunPCA, features = features)
+
+########### perform reference based integration
+#(https://satijalab.org/seurat/articles/integration_large_datasets.html)
+#other type of integration causes memory error
+anchors <- FindIntegrationAnchors(object.list = obj.list, reference = 1, 
+                                  normalization.method = "SCT", anchor.features=features,
+                                  reduction = "rpca", dims = 1:30)
+saveRDS(anchors, file = "./output/anchors.rds")
+
+immune.combined.sct <- IntegrateData(anchorset = anchors, normalization.method = "SCT", dims = 1:30) #this step is ~3 minutes
+
+#workflow after integration based on this: https://github.com/satijalab/seurat/issues/1836
+#########
+immune.combined.sct <- RunPCA(immune.combined.sct, verbose = FALSE)
+immune.combined.sct <- RunUMAP(immune.combined.sct, reduction = "pca", dims = 1:15)
+
+pdf("output/dim_attempts.pdf")
+for (i in 10:30) {
+  immune.combined.sct <- RunUMAP(immune.combined.sct, reduction = "pca", dims = 1:i)
+  px <- DimPlot(immune.combined.sct, reduction = "umap") +ggtitle(paste0(i, " Dims"))
+  py <- DimPlot(immune.combined.sct, reduction = "umap",split.by="orig.ident")
+  print(px/py&NoLegend())
+  
+  immune.combined.sct <- FindNeighbors(immune.combined.sct,reduction="pca",dims=1:i) 
+  #this isrequired to run findclusters on the combined object. see https://github.com/satijalab/seurat/issues/2995
+  seurat.combined.final <- FindClusters(object = immune.combined.sct, resolution = 0.7)
+  p1<- DimPlot(seurat.combined.final, reduction = "umap",label=TRUE)+ggtitle(paste0(i, " Dims"))
+  p3 <- DimPlot(seurat.combined.final, repel =TRUE, split.by="orig.ident")
+  print(p1/p3&NoLegend())
+}
+dev.off()
+
+#after reviewing results of above, decided to go with 10 dims
+pdf("output/dim_final.pdf")
+for (i in 10) {
+  immune.combined.sct <- RunUMAP(immune.combined.sct, reduction = "pca", dims = 1:i)
+  px <- DimPlot(immune.combined.sct, reduction = "umap") +ggtitle(paste0(i, " Dims"))
+  py <- DimPlot(immune.combined.sct, reduction = "umap",split.by="orig.ident")
+  p0 <- DimPlot(immune.combined.sct,reduction="pca")
+  print(p0)
+  print(px/py&NoLegend())
+  
+  immune.combined.sct <- FindNeighbors(immune.combined.sct,reduction="pca",dims=1:i) 
+  #this isrequired to run findclusters on the combined object. see https://github.com/satijalab/seurat/issues/2995
+  seurat.combined.final <- FindClusters(object = immune.combined.sct, resolution = 0.7)
+  p1<- DimPlot(seurat.combined.final, reduction = "umap",label=TRUE)+ggtitle(paste0(i, " Dims"))
+  p3 <- DimPlot(seurat.combined.final, repel =TRUE, split.by="orig.ident")
+  print(p1/p3&NoLegend())
+}
+dev.off()
+
+# saveRDS(immune.combined.sct, file = "output/immune_combined_sct.rds")
+immune.combined.sct <- readRDS("./output/immune_combined_sct.rds")
+# saveRDS(seurat.combined.final, file = "output/seurat_combined_final.rds")
+seurat.combined.final <- readRDS("./output/seurat_combined_final.rds")
+
+rm(anchors)
+rm(obj.list)
+rm(list=ls(pattern="p.*"))
+rm(seurat.subset)
+```
+
+# VI. Multimodal reference mapping
+
+### a. Map to pbmc_multimodal.h5seurat
+
+https://satijalab.org/seurat/articles/multimodal_reference_mapping.html
+
+note this reference supports our integration of the 4 datasets and removal of batch effect before mapping
+https://github.com/satijalab/seurat/issues/3686
+
+```{r}
+reference <- LoadH5Seurat("data/pbmc_multimodal.h5seurat") # compiling this reference object takes a very long time, so here I load a saved copy
+# saveRDS(reference,file="output/pbmc_multimodal_reference_as_rds.rds")
+# reference<-readRDS("output/pbmc_multimodal_reference_as_rds.rds") 
+
+
+anchors <- FindTransferAnchors(
+  reference = reference,
+  query = seurat.combined.final,
+  normalization.method = "SCT",
+  reference.reduction = "spca",
+  dims = 1:50
+)
+saveRDS(anchors,file="output/findTransferAnchors_output.rds")
+
+# # the mapquery function below doesn't work with uwot 0.1.14 
+# # per this page https://github.com/satijalab/seurat/issues/6345
+# # so needed to install older version
+# require(devtools)
+# # remove.packages("uwot"
+# install_version("uwot", version="0.1.11",repos = "http://cran.us.r-project.org")
+
+# then run
+seurat.combined.final <- MapQuery(
+  anchorset = anchors,
+  query = seurat.combined.final,
+  reference = reference,
+  refdata = list(
+    celltype.l1 = "celltype.l1",
+    celltype.l2 = "celltype.l2",
+    celltype.l3 = "celltype.l3",
+    predicted_ADT = "ADT"
+  ),
+  reference.reduction = "spca", 
+  reduction.model = "wnn.umap"
+)
+
+# saveRDS(seurat.combined.final,file="output/seurat_combined_final_afterMapQuery.rds")
+# seurat.combined.final <- readRDS("output/seurat_combined_final_afterMapQuery.rds")
+
+```
+
+### b. Make plots
+
+```{r}
+p1 <- DimPlot(seurat.combined.final, reduction = "ref.umap", group.by = "predicted.celltype.l1", label = TRUE, label.size = 3, repel = TRUE) + NoLegend()
+p2 <- DimPlot(seurat.combined.final, reduction = "ref.umap", group.by = "predicted.celltype.l2", label = TRUE, label.size = 3 ,repel = TRUE) + NoLegend()
+p3 <- DimPlot(seurat.combined.final, reduction = "ref.umap", group.by = "predicted.celltype.l3", label = TRUE, label.size = 3 ,repel = TRUE) + NoLegend()
+p1 + p2  
+p3
+
+p3.5 <- DimPlot(seurat.combined.final, reduction = "ref.umap", group.by = "predicted.celltype.l2", split.by="orig.ident",label = FALSE,repel = TRUE) + NoLegend()
+p3.5
+
+pdf("output/seurat_combined_final_afterMapQuery_plots.pdf");p1;p2;p3;p3.5;dev.off()
+
+p4<-FeaturePlot(seurat.combined.final, features = c("CD8 TEM", "CD4 CTL", "Treg"),  reduction = "ref.umap", cols = c("lightgrey", "darkred")) & theme(plot.title = element_text(size = 10))
+p4
+
+Idents(seurat.combined.final) <- 'predicted.celltype.l3'
+levels(seurat.combined.final) <-  levels(seurat.combined.final) %>% sort
+
+DefaultAssay(seurat.combined.final) <- 'SCT'
+p5<-VlnPlot(seurat.combined.final, features = c("CD3E", "CD4", "CD8B", #"CD69",
+                                                # "CXCR3","cXCR5", 
+                                                "SELL", "CCR7", "TCF7", 
+                                                "GZMK","GZMB","GNLY", "NKG7",#"ZNF683",
+                                                "CTLA4","PDCD1"), 
+            idents=Idents(seurat.combined.final)[grep("CD4|CD8|NK|dnT|gdT|MAIT|Treg",Idents(seurat.combined.final))],
+            stack=TRUE,sort = FALSE,flip=TRUE) + 
+  theme(axis.text.x = element_text(size=8))+NoLegend()
+p5
+
+goi <- c(#"IDO1", 
+         "NKG7", "PDCD1","LCK", "CCL5", "IFNG", "CXCR6", "CD27", "CD69", "CD8A", "CD8B", "CD3E", "CD3G", "TIGIT")
+p5.5<-VlnPlot(seurat.combined.final, features = goi, 
+            idents=Idents(seurat.combined.final)[grep("CD4|CD8|NK|dnT|gdT|MAIT|Treg",Idents(seurat.combined.final))],
+            stack=TRUE,sort = FALSE,flip=TRUE) + theme(axis.text.x = element_text(size=8))+NoLegend()+ggtitle("GOI from RP 06-20-2023",subtitle="IDO1 excluded due to same value across all cells")
+p5.5
+
+DefaultAssay(seurat.combined.final) <- 'predicted_ADT'
+# see a list of proteins: rownames(pbmc3k)
+p6<-FeaturePlot(seurat.combined.final, features = c("CD3-1", "CD45RA", "IgD"), reduction = "ref.umap", cols = c("lightgrey", "darkgreen"), ncol = 3)
+p6
+
+pdf("output/seurat_combined_final_afterMapQuery_plots2.pdf");p4;p5;p5.5;p6;dev.off()
+
+############ alternative viz
+DefaultAssay(seurat.combined.final) <- 'SCT'
+
+pdf("output/seurat_combined_final_afterMapQuery_plots_MyUmap.pdf")
+lapply(1:3, function(x) {
+  DimPlot(seurat.combined.final, reduction = "umap", 
+          group.by = paste0("predicted.celltype.l", x), 
+          label=TRUE,
+          repel = TRUE) + NoLegend()
+ 
+});DimPlot(seurat.combined.final, reduction = "umap", 
+          split.by="orig.ident",
+          repel = TRUE) + NoLegend()
+dev.off()
+```
+
+# VII. Session info
+```{r sessioninfo}
+sessionInfo()
+writeLines(capture.output(sessionInfo()), "sessionInfo_1_preprocessing.txt")
+```

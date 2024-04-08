@@ -1,0 +1,1334 @@
+---
+title: "Peripheral scTCR/RNA analysis"
+author: "Daniel Shu"
+date: 'Compiled: `r format(Sys.Date(), "%B %d, %Y")`'
+output: 
+  html_document:
+    keep_md: yes
+    toc: true
+    toc_float: true
+    collapsed: true
+    toc_depth: 3
+    number_sections: true
+    theme: lumen
+editor_options: 
+  markdown: 
+    wrap: 72
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE,
+                      warning = FALSE, cache= FALSE, 
+                      tidy = TRUE,
+                      dpi = 600, fig.width = 12, fig.height = 8)
+```
+
+# I. Setup
+
+### A. Load libraries
+
+```{r libraries}
+library(Seurat)
+library(ggplot2)
+library(ggpubr)
+library(patchwork)
+library(ggprism)
+library(tidyverse)
+library(tools)
+library(scRepertoire)
+library(gridExtra)
+library(kableExtra)
+library(RColorBrewer)
+library(pals)
+library(ggnewscale)
+```
+
+### C. Export settings
+
+```{r settings_export}
+source = "10x"
+analysis = "sc"
+repertoire = "T" #Define the repertoire under study
+type = "pbmc"  
+az_level = "l3" #set azimuth level for analysis
+output.path = paste0("output/")
+#creates output.path directory if not already present
+ifelse(!dir.exists(output.path), dir.create(output.path), paste0(output.path, " ", "directory already exists"))
+```
+
+### D. Load scripts
+
+```{r}
+source("scripts/T_cell_goi.R")
+```
+
+# II. Load data
+### A. Load seurat object 
+```{r}
+seurat <- readRDS("output/seurat_combined_final_afterMapQuery.rds")
+
+DefaultAssay(seurat) <- 'SCT'
+
+#Assign identities based on azimuth
+Idents(seurat) <- paste0("predicted.celltype.", az_level)
+
+#Re-order idents
+levels.manual <- sort(levels(seurat))
+Idents(seurat) <- factor(x = Idents(seurat), levels = levels.manual)
+Idents(seurat) %>% levels
+
+#descriptive stats and plots for all clusters, pre subsetting
+cells.by.type <- table(Idents(seurat)) %>% as.data.frame() 
+ggplot(cells.by.type, aes(x = Var1, #reorder(Var1, desc(Freq)), 
+                          y = Freq, fill=Var1))+
+  geom_col()+ #scale_fill_manual(values=pals::kovesi.rainbow_bgyr_35_85_c72(nrow(cells.by.type)))+
+  ggprism::theme_prism()+theme(axis.text.x = element_text(angle=45, hjust=1, vjust=1,size=6
+                                                          ))+theme(legend.position="null")+ggtitle("Single cells per cluster, before removal")+xlab("Cluster")+ylab("Cell count")
+  ggsave(paste0(output.path,"summary_all_B_and_T_asbarplot_pre.pdf"), height=10, width=10)
+
+df <- cells.by.type %>% 
+  bind_rows(summarise_all(., ~if(is.numeric(.)) {sum(.)} else "Total"))
+df %>% 
+  write.csv(file = paste0(output.path, "summary_all_B_and_T_pre.csv"),row.names = FALSE)
+df %>% 
+  kbl(caption = "Summary of all cell types (B and T)", align = 'c') %>%
+  kable_classic(full_width= FALSE) %>% 
+  save_kable(., paste0(output.path, "summary_all_B_and_T_pre.pdf"))
+rm(df)
+DimPlot(seurat)+guides(colour = guide_legend(ncol = 2))
+ggsave(paste0(output.path, "dimplot_all_T_and_B_pre.pdf"), height=10, width=10)
+```
+
+### B. Single cell TCR data
+
+```{r}
+### data dir for vdj
+vdj.dir <- "./data" 
+
+#Create list of filtered contig files, named for each sample, sample type (PBMC or TIL), and type of repertoire (T or B cell)
+fc.filenames <- list.files(vdj.dir, pattern="filtered_contig_annotations.csv", recursive= TRUE, full.names = TRUE)
+fc.filenames
+
+contig_list <- list()
+
+for(i in fc.filenames){
+   contig_list[[i]] = read.table(i,
+                   header = TRUE,
+                   stringsAsFactors = FALSE,
+                   as.is = TRUE,
+                   fill = TRUE,
+                   comment.char = "",
+                   sep = ',')
+}
+names(contig_list)
+names(contig_list) <- names(contig_list) %>% str_replace("./data/","") %>% str_replace("/filtered.*","")
+names(contig_list)
+
+# For the filtered contigs, the barcode suffixes for each sample are "-1".
+# The barcodes in the seurat object all end in -1, and each barcode has been prefixed with the sample name, e.g. "2101A_ACTGCTCAGTTCGCGC-1".
+# we use the combineTCR function to add the sample names as prefixes to the barcode, which should match the seurat@meta.data rownames
+
+# Combine the T and B cell contigs using combineTCR 
+#Code below is based on 'Starting work with scRepertoire v1.5.2.' (https://ncborcherding.github.io/vignettes/vignette.html) Website is dated 5/12/2022. I accessed it on 5/24/2022
+
+combined <- combineTCR(contig_list,
+                         samples = names(contig_list), 
+                         # ID = names(contig_list),
+                         cells = "T-AB")
+rm(contig_list)
+
+saveRDS(combined, file = "output/combined.rds")
+# combined <- readRDS("output/combined.rds")
+
+#combine TCR data with seurat object
+#note that I have previously changed the barcodes in the combined file for each sample to match the barcodes in the seurat object
+seurat <- combineExpression(combined, seurat, 
+                            cloneCall="gene", group.by = "sample", proportion = FALSE, 
+                            cloneTypes=c(Single=1, Small=5, Medium=20, Large=100, Hyperexpanded=500))
+
+seurat@meta.data$cloneType <- factor(seurat@meta.data$cloneType, levels = c(
+  "Hyperexpanded (100 < X <= 500)",
+  "Large (20 < X <= 100)",
+  "Medium (5 < X <= 20)",
+  "Small (1 < X <= 5)",
+  "Single (0 < X <= 1)", NA))
+
+#Show which clusters have TCRs
+#Before doing this, create 2 table to give sense of # of cells removed 
+seurat@meta.data$hasTCR = if_else(is.na(seurat@meta.data$barcode), "No", "Yes")
+seurat@meta.data %>% count(hasTCR, sort= TRUE) %>%   
+  bind_rows(summarise_all(., ~if(is.numeric(.)) {sum(.)} else "Total")) %>% 
+  write.csv(file = paste0(output.path, "summary_cells_with_without_TCR.csv"),row.names = FALSE)
+
+seurat@meta.data %>% count(hasTCR, sort= TRUE) %>%   
+  bind_rows(summarise_all(., ~if(is.numeric(.)) {sum(.)} else "Total")) %>% 
+  kbl(caption = "Summary of cells with and without TCRs", align = 'c') %>%
+  kable_classic(full_width= FALSE) %>%
+  save_kable(., paste0(output.path, "summary_cells_with_without_TCR.pdf"))
+
+
+seurat@meta.data %>% count(predicted.celltype.l3, hasTCR) %>% group_by(predicted.celltype.l3) %>% arrange(desc(hasTCR), .by_group= TRUE) %>% ungroup %>% bind_rows(summarise_all(., ~if(is.numeric(.)) {sum(.)} else "Total")) %>%
+  write.csv(file = paste0(output.path, "summary_cells_with_without_TCR_byCluster.csv"),row.names = FALSE)
+
+seurat@meta.data %>% count(predicted.celltype.l3, hasTCR) %>% group_by(predicted.celltype.l3) %>% arrange(desc(hasTCR), .by_group= TRUE) %>% ungroup %>% bind_rows(summarise_all(., ~if(is.numeric(.)) {sum(.)} else "Total")) %>%
+  kbl(caption = "Summary of cells with and without TCRs, by cluster", align = 'c') %>%
+  kable_classic(full_width= FALSE) %>%
+  save_kable(., paste0(output.path, "summary_cells_with_without_TCR_byCluster.pdf"))
+
+#Save seurat object
+# seurat <- readRDS(paste0(output.path,"seurat_after_TCR.rds"))
+# saveRDS(seurat,file=paste0(output.path,"seurat_after_TCR.rds"))
+
+pdf("output/seurat_with_scTCR_allClusters_cloneType.pdf")
+DimPlot(seurat,reduction="ref.umap",group.by="cloneType")+
+  theme(legend.position = "bottom")&NoAxes()
+DimPlot(seurat,group.by="cloneType")+
+  theme(legend.position = "bottom")&NoAxes()
+dev.off()
+```
+
+### C. Adaptive TCR data 
+#### 1. Load Adaptive TCRs of interest
+```{r}
+pt_names <- seurat$Patient %>% unique
+
+adaptive <- list()
+adaptive <- lapply(1:length(pt_names), function(i) {
+  readxl::read_excel(path="data/Sig_Expanded_TCRs.xlsx", 
+                     sheet=paste0(pt_names[[i]], " analysis (Sig Exp)"), 
+                     col_names= TRUE) %>% 
+    # select(aminoAcid) %>% 
+    rename(CDR3.aa = aminoAcid) %>% 
+    rename(CDR3.nt = nucleotide)
+})
+names(adaptive) <- pt_names
+names(adaptive)
+
+```
+
+#### 2. Add adaptive TCRs to seurat object
+
+```{r map_clonotypes}
+#this is housekeeping to doublecheck the number of duplicated CDR3aa and CDRnt per sample in the adaptive data
+x<- lapply(1:length(adaptive), function(i) {
+  adaptive[[i]][duplicated(adaptive[[i]]$CDR3.aa) | duplicated(adaptive[[i]]$CDR3.aa, fromLast = TRUE),] %>% 
+    nrow
+}) %>% unlist
+
+y<- lapply(1:length(adaptive), function(i) {
+  adaptive[[i]][duplicated(adaptive[[i]]$CDR3.nt) | duplicated(adaptive[[i]]$CDR3.nt, fromLast = TRUE),] %>% 
+    nrow
+}) %>% unlist 
+
+df <- tibble(names(adaptive), sapply(adaptive, nrow), x, y)
+colnames(df) <- c("patient", "total.clonotypes", "duplicated.cdr3.aa", "duplicated.cdr3.nt")
+df
+
+#########
+#########
+#create adaptive.bindrows object, which  will be used to determine which TCRs are shared between datasets
+adaptive.bindrows <- adaptive %>% 
+  bind_rows(., .id = "Sample")   #collapses list into one dataframe
+
+#Add column to seurat object for TCRB or IGH data (this allows cross-referencing of single cell against Adaptive datasets)
+seurat$TCRB_or_IGH <- gsub(".*_", "", seurat@meta.data$CTaa) 
+seurat$TCRB_or_IGH %>% is.na() %>% table
+paste0(length(grep(";",seurat$TCRB_or_IGH )), " cells/rows in seurat object have two tcrb")
+# add the second column for TCRB or IGH
+seurat$TCRB_or_IGH2 <- NA
+# find entries that should be split by ; 
+tosplit <- grep(";",seurat$TCRB_or_IGH ) 
+# split by ";" and add the second part to TCRB_or_IGH2 
+seurat@meta.data[tosplit,"TCRB_or_IGH2"] <- sapply(strsplit(seurat@meta.data[tosplit,"TCRB_or_IGH"],";"), function(x) x[[2]]) 
+# and replace TCRB_or_IGH with the first half 
+# you need to do it in this order, otherwise you will loose the second part
+seurat@meta.data[tosplit,"TCRB_or_IGH"] <- sapply(strsplit(seurat@meta.data[tosplit,"TCRB_or_IGH"],";"), function(x) x[[1]])
+
+#these 3 lines doublecheck that this worked
+seurat@meta.data[tosplit, "TCRB_or_IGH"]
+seurat@meta.data[tosplit, "TCRB_or_IGH2"]
+grep(";",seurat$TCRB_or_IGH ) %>% length # this should return 0, i.e. all the tcrs with doublets for tcra tcrb were split
+
+##########
+##########
+
+#now add column to seurat metadata and adaptive.bindrows with sample name_tcrb 
+seurat$patient_tcrb <- paste(seurat@meta.data$Patient, seurat@meta.data$TCRB_or_IGH, sep="_") 
+seurat$patient_tcrb2 <- paste(seurat@meta.data$Patient, seurat@meta.data$TCRB_or_IGH2, sep="_") 
+adaptive.bindrows$Sample_CDR3.aa <- paste(adaptive.bindrows$Sample, adaptive.bindrows$CDR3.aa, sep="_")
+
+#Add column to seurat object if there is any match in adaptive data for that particular patient
+seurat$expanded.post.vaccine1 <- ifelse(seurat@meta.data$patient_tcrb %in% adaptive.bindrows$Sample_CDR3.aa, 1, 0)
+seurat$expanded.post.vaccine1 %>% table
+seurat$expanded.post.vaccine2 <- ifelse(seurat@meta.data$patient_tcrb2 %in% adaptive.bindrows$Sample_CDR3.aa, 1, 0)
+seurat$expanded.post.vaccine2 %>% table
+
+#figure out how many adaptive TCRs are present in seurat metadata, first tcr column
+unique.match1 <- adaptive.bindrows$Sample_CDR3.aa[adaptive.bindrows$Sample_CDR3.aa %in% seurat@meta.data$patient_tcrb] 
+unique.match2 <- adaptive.bindrows$Sample_CDR3.aa[adaptive.bindrows$Sample_CDR3.aa %in% seurat@meta.data$patient_tcrb2] 
+unique.match1
+unique.match2
+unique.match.total <- c(unique.match1, unique.match2)
+unique.match.total[(duplicated(unique.match.total))]
+unique.match.total %>% length
+unique.match.total %>% unique %>% length
+
+paste0(length(unique(unique.match.total)), " unique TCRs out of ", length(unique(adaptive.bindrows$Sample_CDR3.aa)), " TCRs, which were clonally expanded in adaptive data, have a match single cell dataset")
+
+df <- data.frame(Patient_TCRB = unique(adaptive.bindrows$Sample_CDR3.aa)) 
+df$matched <- ifelse(df$Patient_TCRB %in% unique.match.total, 1,0)
+df <- separate(df, Patient_TCRB, into=c("Patient", "TCRB"), sep="_") %>% 
+  bind_rows(summarise_all(., ~if(is.numeric(.)) {sum(.)} else "Total"))
+df
+write.csv(df,file= 
+            paste0(output.path, "final_table_TCR_match_results_adaptive_in_single cell.csv"), row.names= FALSE)
+
+#consolidate the two columns into one column, which is true if either of the two TCRBs were found in the patient's adaptive data
+seurat$expanded.post.vaccine <- ifelse(seurat$expanded.post.vaccine1+seurat$expanded.post.vaccine2 >= 1, 1, 0)
+
+#remove adaptive.bindrows object
+rm(adaptive.bindrows)
+
+# saveRDS(seurat, file=paste0(output.path,"seurat_after_TCR_andAdaptive.rds"))
+# seurat <- readRDS(paste0(output.path,"seurat_after_TCR_andAdaptive.rds"))
+
+```
+#### 3. Plots for adaptive_on_sc
+```{r map_clonotypes}
+#create object seurat.expanded, which is a subset of seurat metadata that contains only cells present in adaptive data (clones >=1)
+seurat.expanded <- seurat@meta.data %>% filter(expanded.post.vaccine==1)
+
+#create 2 lists with the suffix .bypatient, which are seurat.expanded and seurat.expanded.excludeSingletons split by orig.ident
+seurat.expanded.orig.ident <- split(seurat.expanded, f=seurat.expanded$orig.ident)
+cells.of.interest <- lapply(seurat.expanded.orig.ident,rownames)
+DimPlot(seurat, #reduction="UMAP",
+        group.by="predicted.celltype.l2",label= TRUE) + theme(legend.position = "null") +
+  DimPlot(seurat, #reduction="UMAP",
+          cells.highlight = cells.of.interest,
+          cols.highlight=c("red", "blue", "purple", "darkgreen"),
+          split.by = "orig.ident",ncol=2)&NoAxes()
+ggsave("output/seurat_after_TCR_andAdaptive_adaptiveonUMAP_predicted_l2.pdf",
+       width=12,height=8)
+
+seurat.expanded.bypatient <- split(seurat.expanded, f=seurat.expanded$Patient)
+cells.of.interest.bypatient <- lapply(seurat.expanded.bypatient,rownames)
+DimPlot(seurat, #reduction="UMAP",
+        group.by="predicted.celltype.l2",label= TRUE) + theme(legend.position = "null") +
+  DimPlot(seurat, #reduction="UMAP",
+          cells.highlight = cells.of.interest.bypatient,
+          cols.highlight=c("red", "blue", "purple"),# "darkgreen"),
+          split.by = "Patient", ncol=2)&NoAxes()
+ggsave("output/seurat_after_TCR_andAdaptive_adaptiveonUMAP_predicted_l2_bypatient.pdf",
+       width=12,height=8)
+
+seurat@meta.data %>% group_by(orig.ident) %>% 
+  summarise(n_cells_expanded.post.vaccine = sum(expanded.post.vaccine)) %>%  
+  bind_rows(summarise_all(., ~if(is.numeric(.)) {sum(.)} else "Total")) %>% 
+  kbl(caption = "Single cells with TCR expanded in Adaptive Bulk Data", align = 'c') %>%
+  kable_classic(full_width= FALSE) %>%
+  save_kable(., paste0(output.path, "summary_cells_with_without_TCR_expandedInAdaptive.pdf"))
+
+seurat@meta.data %>% group_by(predicted.celltype.l2,expanded.post.vaccine) %>% 
+  summarise(n_cells_expanded.post.vaccine = sum(expanded.post.vaccine)) %>% 
+            # n_unique_cdr3aa_expanded.post.vaccine = n_distinct(CTaa)) %>%  
+  ungroup() %>% 
+  arrange(desc(n_cells_expanded.post.vaccine)) %>% 
+  filter(expanded.post.vaccine==1) %>% select(-expanded.post.vaccine) %>% 
+  bind_rows(summarise_all(., ~if(is.numeric(.)) {sum(.)} else "Total")) %>% 
+  kbl(caption = "Single cells with TCR expanded in Adaptive Bulk Data, by cluster", align = 'c') %>%
+  kable_classic(full_width= FALSE) %>%
+  save_kable(., paste0(output.path, "summary_cells_with_without_TCR_expandedInAdaptive_byCluster.pdf"))
+
+df <- seurat@meta.data %>% group_by(predicted.celltype.l2) %>% 
+  summarise(n_cells_expanded.post.vaccine = sum(expanded.post.vaccine)) %>%  
+  arrange(desc(n_cells_expanded.post.vaccine)) %>%
+  filter(n_cells_expanded.post.vaccine>0)
+ggplot(df,aes(x=predicted.celltype.l2, y=n_cells_expanded.post.vaccine, fill=predicted.celltype.l2))+
+  geom_bar(stat="identity")+coord_flip()+
+  ggprism::theme_prism()+geom_text(aes(label=n_cells_expanded.post.vaccine), hjust=0)
+ggsave("output/seurat_after_TCR_andAdaptive_expanded_TCRs_breakdownByCluster.pdf")
+```
+
+### D. Subset for clusters of interest (CD4, CD8, Treg, dnT, gdT, MAIT, NK)
+N.B. Based on the table created above showing TCR mapping by cluster (summary_cells_with_without_TCR_bycluster.pdf), there are cells assigned by reference mapping to non-T cell clusters which have TCRs. Unclear if these are doublets or truly T cells that were misaligned. For now, will exclude them 
+
+```{r}
+#Subset for sample under analysis 
+unique(Idents(seurat))[order(unique(Idents(seurat)))]
+T.clustOfInterest <- "CD4|CD8|Treg|dnT|gdT|MAIT|NK"
+seurat.idents <- unique(Idents(seurat))
+T.idents <- seurat.idents[grep(T.clustOfInterest, seurat.idents)] 
+seurat <- subset(seurat, idents = T.idents)
+
+# levels(seurat) 
+sort(levels(seurat))
+levels(seurat) <- sort(levels(seurat))
+
+DimPlot(seurat#,cols=cluster_colors
+        ) +ggtitle(paste0("T and NK cell clusters prior to singletons removal (n=", nrow(seurat@meta.data), ")"))
+ggsave(filename = paste0(output.path, "dimplot_seurat_after_subset.pdf"),width = 12, height = 8)
+```
+
+### E. Use CellSelector to remove stray cells which were in B and monocyte clusters
+```{r}
+plot <- DimPlot(object = seurat)
+cells.B <- CellSelector(plot = plot)
+cells.B
+
+cells.mono <- CellSelector(plot = plot)
+cells.mono
+
+cells_to_remove <- c(cells.B, cells.mono)
+cells_to_remove %>% length
+print(paste0("Removing ", length(cells_to_remove), " cells since they are in the B and monocyte areas of UMAP"))
+
+seurat <- subset(seurat, cells=cells_to_remove, invert= TRUE)
+
+# saveRDS(seurat,"output/seurat_after_subset_after_removal_B_and_mono.rds")
+# seurat <- readRDS("output/seurat_after_subset_after_removal_B_and_mono.rds")
+```
+
+# III. Round I, clustering
+### A. Collapse clusters not of interest
+```{r}
+#collapse clusters that are not of interest
+#i.e. dnT, gdT, Treg
+## Collapse the clusters that are not the focus of this analysis (i.e. e.g. Treg naive + Treg memory -> Treg, etc.). Here I have applied this to NKT)
+cluster_merge <- data.frame(old_id = levels(seurat), new_id = NA, level=NA)
+write.csv(cluster_merge,"data/cluster_merge_PBMC.csv",row.names= FALSE)
+#edit that file with manual cluster assignments then reupload
+cluster_merge_DS <- read.csv("data/cluster_merge_DS.csv")
+cluster_merge_DS <- cluster_merge_DS[order(cluster_merge_DS$level),] 
+
+#assign new identities
+new.cluster.ids <- cluster_merge_DS$new_id
+names(new.cluster.ids) <- cluster_merge_DS$old_id
+
+new.cluster.ids
+if (all(unique(Idents(seurat)) %in% names(new.cluster.ids)) == TRUE) { #doublechecks that the new.cluster.ids has a new ident for each old ident, before subsetting the new.cluster.ids object for what is in Idents(seura)
+new.cluster.ids <- new.cluster.ids[names(new.cluster.ids) %in% Idents(seurat)] #rename the clusteres that are present in the dataset
+seurat <- RenameIdents(seurat, new.cluster.ids)
+print("successful id reassignment")
+}
+
+Idents(seurat) %>% table #check idents
+
+#set levels
+levels.manual <- unique(cluster_merge_DS$new_id)
+Idents(seurat) <- factor(x = Idents(seurat), levels = levels.manual)
+
+DimPlot(seurat,label= TRUE,repel= TRUE) +ggtitle(paste0("T and NK cell clusters (n=", nrow(seurat@meta.data), ")"))&NoLegend()&NoAxes()
+ggsave(filename = paste0(output.path, "dimplot_seurat_after_subset_after_collapse.pdf"))
+
+# saveRDS(seurat, paste0(output.path, "seurat_after_subset_after_collapse.rds"))
+# seurat <- readRDS(file=paste0(output.path,"seurat_after_subset_after_collapse.rds"))
+```
+### B. Run FindAllMarkers and make heatmap
+```{r}
+# need to run PrepSCTFindMarkers first, note this one took 30 min, DO NOT EVER RUN AGAIN IF CAN BE AVOIDED
+seurat <- PrepSCTFindMarkers(seurat, assay="SCT", verbose= TRUE) 
+
+# saveRDS(seurat, paste0(output.path, "seurat_after_subset_after_collapse_afterPrepSCTFindMarkers.rds"))
+# seurat <- readRDS(file=paste0(output.path,"seurat_after_subset_after_collapse_afterPrepSCTFindMarkers.rds"))
+
+markers <- FindAllMarkers(seurat, assay="SCT", test.use = "MAST", only.pos = TRUE, min.pct = 0.1, logfc.threshold = 0.25)
+
+# saveRDS(markers, file=paste0(output.path,"findAllMarkers.rds"))
+# markers <- readRDS(paste0(output.path,"findAllMarkers.rds"))
+
+markers %>%
+    group_by(cluster) %>%
+    slice_max(n = 3, order_by = avg_log2FC) -> top3
+markers %>%
+    group_by(cluster) %>%
+    top_n(n =10, wt = avg_log2FC) -> top10
+markers %>%
+    group_by(cluster) %>%
+    top_n(n =5, wt = avg_log2FC) -> top5
+
+#getting this error when I try to do DoHeatmap
+# Error in Seurat::DoHeatmap(seurat, features = top10, size = 2) : 
+#   No requested features found in the scale.data slot for the SCT assay.
+# so rescaling the data per https://github.com/satijalab/seurat/issues/2960
+
+seurat<-ScaleData(seurat, features=c(markers$gene,goi.all), verbose = FALSE)#this line makes sure that all of the variable features (in markers object) and all of the genes of interest are included in the scaledata used for the heatmap
+
+pdf(paste0(output.path,"FindAllMarkers_before_cluster_annotation.pdf"),width=12,height=8)
+Seurat::DoHeatmap(subset(seurat, downsample =50), 
+                  features=top5$gene,size=3)#+
+ # theme(legend.text = element_text(size = 4),
+ #      axis.text.y = element_text(size = 5))
+dev.off()
+
+pdf(paste0(output.path,"GOI_all_before_cluster_annotation.pdf"),width=12,height=8)
+Seurat::DoHeatmap(subset(seurat, downsample =50), 
+                  features=goi.all,size = 1)+
+   theme(legend.text = element_text(size = 4),
+      axis.text.y = element_text(size = 5))
+dev.off()
+
+# saveRDS(seurat, paste0(output.path, "seurat_after_subset_after_collapse_afterPrepSCTFindMarkers_afterscaling.rds"))
+# seurat <- readRDS(file=paste0(output.path,"seurat_after_subset_after_collapse_afterPrepSCTFindMarkers_afterscaling.rds"))
+```
+# IV. Round 2, clustering
+### A. Collapse cluster not of interest, round2
+```{r load_seurat2}
+## Collapse the clusters that are not the focus of this analysis (CD4 Naive, CD4 Proliferating, CD4 TCM, CD4 TEM, CD4 CTL, CD8 TCM). Leave CD8 TEM subsets at l3 granularity. Collapse NKs.
+cluster_merge <- data.frame(old_id = levels(seurat), new_id = NA, level=NA)
+write.csv(cluster_merge,"data/cluster_merge_PBMC_round2.csv",row.names= FALSE)
+
+#edit that file with manual cluster assignments then reupload
+cluster_merge_DS <- read.csv("data/cluster_merge_DS_round2.csv")
+cluster_merge_DS <- cluster_merge_DS[order(cluster_merge_DS$level),] #reorder by level column, which will be used below to facilitate levels assignment
+
+#assign new identities
+new.cluster.ids <- cluster_merge_DS$new_id
+names(new.cluster.ids) <- cluster_merge_DS$old_id
+
+new.cluster.ids
+if (all(unique(Idents(seurat)) %in% names(new.cluster.ids)) == TRUE) { #doublechecks that the new.cluster.ids has a new ident for each old ident, before subsetting the new.cluster.ids object for what is in Idents(seura)
+new.cluster.ids <- new.cluster.ids[names(new.cluster.ids) %in% Idents(seurat)] #rename the clusteres that are present in the dataset
+seurat <- RenameIdents(seurat, new.cluster.ids)
+print("successful id reassignment")
+}
+
+Idents(seurat) %>% table #check idents
+
+#set levels
+levels.manual <- unique(cluster_merge_DS$new_id)
+Idents(seurat) <- factor(x = Idents(seurat), levels = levels.manual)
+
+pdf("output/dimplot_seurat_after_subset_after_collapse_round2.pdf")
+DimPlot(seurat,label= TRUE,repel= TRUE) +ggtitle(paste0("T and NK cell clusters, round 2 clustering (n=", nrow(seurat@meta.data), ")"))&NoAxes()
+DimPlot(seurat,label= TRUE,repel= TRUE,reduction="ref.umap") +ggtitle(paste0("T and NK cell clusters, round 2 (n=", nrow(seurat@meta.data), ")"))&NoAxes()
+dev.off()
+
+# saveRDS(seurat, paste0(output.path, "seurat_after_subset_after_collapse_round2.rds"))
+# seurat <- readRDS(file=paste0(output.path,"seurat_after_subset_after_collapse_round2.rds"))
+```
+### B. Run FindAllMarkers and make heatmap
+```{r}
+# dont need to run PrepSCTFindMarkers again
+# seurat <- PrepSCTFindMarkers(seurat, assay="SCT", verbose= TRUE)
+
+markers2 <- FindAllMarkers(seurat, assay="SCT", test.use = "MAST", only.pos = TRUE, min.pct = 0.1, logfc.threshold = 0.25)
+
+# saveRDS(markers2, file=paste0(output.path,"findAllmarkers2.rds"))
+# markers2 <- readRDS(paste0(output.path,"findAllmarkers2.rds"))
+
+markers2 %>%
+    group_by(cluster) %>%
+    slice_max(n = 3, order_by = avg_log2FC) -> top3
+markers2 %>%
+    group_by(cluster) %>%
+    top_n(n =10, wt = avg_log2FC) -> top10
+markers2 %>%
+    group_by(cluster) %>%
+    top_n(n =5, wt = avg_log2FC) -> top5
+
+#this line makes sure that all of the variable features (in markers object) and all of the genes of interest are included in the scaledata used for the heatmap
+seurat<-ScaleData(seurat, features=c(markers2$gene,goi.all), verbose = FALSE)
+
+pdf(paste0(output.path,"FindAllmarkers_before_cluster_annotation_round2.pdf"),width=12,height=8)
+Seurat::DoHeatmap(subset(seurat, downsample =50), 
+                  features=top5$gene,size=3)
+dev.off()
+pdf(paste0(output.path,"GOI_all_before_cluster_annotation_round2.pdf"),width=12,height=8)
+Seurat::DoHeatmap(subset(seurat, downsample =50),
+                  features=goi.all)+
+  theme(legend.text = element_text(size = 5),
+      axis.text.y = element_text(size = 6))
+dev.off()
+
+# saveRDS(seurat, paste0(output.path, "seurat_after_subset_after_collapse_afterPrepSCTFindmarkers2_afterscaling.rds"))
+# seurat <- readRDS(file=paste0(output.path,"seurat_after_subset_after_collapse_afterPrepSCTFindmarkers2_afterscaling.rds"))
+```
+
+# V. Final figures
+
+### A0. Summary stats
+```{r}
+#add active ident column to metadata
+seurat@meta.data$active.ident <- Idents(seurat)
+
+#summarize cells with TCR
+#Before doing this, create 2 table to give sense of # of cells removed 
+# seurat@meta.data$hasTCR <- if_else(is.na(seurat@meta.data$barcode), "No", "Yes")
+seurat@meta.data %>% count(hasTCR, sort= TRUE) %>%   
+  bind_rows(summarise_all(., ~if(is.numeric(.)) {sum(.)} else "Total")) %>% 
+  write.csv(file=paste0(output.path, "final_summary_cells_with_without_TCR.csv"),row.names = FALSE)
+  # kbl(caption = "Summary of cells with and without TCRs", align = 'c') %>%
+  # kable_classic(full_width= FALSE) %>%
+  # save_kable(., paste0(output.path, "summary_cells_with_without_TCR.pdf"))
+
+seurat@meta.data %>% count(active.ident, hasTCR) %>% group_by(active.ident) %>% arrange(desc(hasTCR), .by_group= TRUE) %>% ungroup %>% bind_rows(summarise_all(., ~if(is.numeric(.)) {sum(.)} else "Total")) %>% 
+    write.csv(file=paste0(output.path, "final_summary_cells_with_without_TCR_byCluster.csv"),row.names = FALSE)
+  # kbl(caption = "Summary of cells with and without TCRs, by cluster", align = 'c') %>%
+  # kable_classic(full_width= FALSE) %>%
+  # save_kable(., paste0(output.path, "summary_cells_with_without_TCR_byCluster.pdf"))
+```
+
+
+### A1. Assign colors
+```{r load_seurat2}
+cluster_colors <- rev(
+  pals::polychrome(n=length(unique(cluster_merge_DS$new_id))+2 +6))
+#) 
+#add 2 to drop light and dark gray
+# names(temp) <- names(cluster_colors)
+# temp %>% pal.bands()
+# cluster_colors<-cluster_colors[1:(length(cluster_colors)-2)]
+cluster_colors<-cluster_colors[c(1,3,4,2,5, 6:9,
+                                16:(length(cluster_colors)-2))] #dnT thru Treg
+names(cluster_colors) <- unique(cluster_merge_DS$new_id)
+cluster_colors %>% pal.bands()
+
+#change CD8 TEM color to black
+cluster_colors["CD8 TEM"] <- "black"
+cluster_colors %>% pal.bands()
+```
+
+### A2. Clean up goi
+```{r load_seurat2}
+#### subset goi.all.list for only those genes present in seurat object
+names.goi.list <- names(goi.all.list)
+unlist(goi.all.list) %>% length #check length before subsetting
+unlist(goi.all.list)[!unlist(goi.all.list) %in% rownames(seurat)]  #identify genes that will be dropped from goi
+goi.all.list <- lapply(1:length(goi.all.list), function(i){ #subset
+ goi.all.list[[i]] <-  goi.all.list[[i]][goi.all.list[[i]] %in% rownames(seurat)]
+})
+unlist(goi.all.list) %>% length #check length after subsetting
+names(goi.all.list) <- names.goi.list
+
+#do the same for the object goi.all 
+goi.all %>% length
+goi.all <- goi.all[goi.all%in%rownames(seurat)]
+goi.all %>% length
+```
+### B.  Final Heatmaps
+```{r}
+# markers2 <- readRDS(paste0(output.path,"findAllmarkers2.rds")) #reloads from above in case the above chunk wasn't run
+
+markers <- markers2 #use the markers from 2nd round of FindAllMarkers
+# 
+#subset to remove mitochondrial genes
+nrow(markers)
+grep("MT-",markers$gene)
+markers$gene[grep("MT-",markers$gene)]
+markers <- markers[-grep("MT-",markers$gene),]
+grep("MT-",markers$gene)
+nrow(markers)
+
+markers %>%
+    group_by(cluster) %>%
+    slice_max(n = 3, order_by = avg_log2FC)
+markers %>%
+    group_by(cluster) %>%
+    top_n(n =10, wt = avg_log2FC) -> top10
+markers %>%
+    group_by(cluster) %>%
+    top_n(n =5, wt = avg_log2FC) -> top5
+
+markers %>%
+    group_by(cluster) %>%
+    top_n(n =3, wt = avg_log2FC) -> top3
+
+#make new heatmaps
+pdf(paste0(output.path,"final_FindAllMarkers_top5.pdf"),width=11.5,height=8.5)
+Seurat::DoHeatmap(subset(seurat, downsample =50),
+                  group.colors=cluster_colors,
+                  features=top5$gene,size=3)+guides(color="none")+
+  theme(axis.text.y = element_text(face="italic",size=7),
+        legend.text=element_text(size=7),
+        plot.margin = margin(0, 0, 0, 0, "cm")
+        )
+
+Seurat::DoHeatmap(subset(seurat, downsample =50),
+                   group.colors=cluster_colors,
+                  features=top10$gene,size=3)+
+ theme(#legend.text = element_text(size = 4),
+      axis.text.y = element_text(size = 7))+guides(color="none")
+dev.off()
+
+pdf(paste0(output.path,"final_FindAllMarkers_top3.pdf"),width=12,height=8)
+Seurat::DoHeatmap(subset(seurat, downsample =50),
+                   group.colors=cluster_colors,
+                  features=top3$gene,size=3)+
+ theme(#legend.text = element_text(size = 4),
+      axis.text.y = element_text(size = 7))+guides(color="none")
+dev.off()
+
+pdf(paste0(output.path,"final_GOI_heatmap.pdf"),width=12,height=8)
+Seurat::DoHeatmap(subset(seurat, downsample =50),
+                   group.colors=cluster_colors,
+                  features=goi.all,size = 3)+
+   theme(#legend.text = element_text(size = 4),
+      axis.text.y = element_text(size = 7))+guides(color="none")
+dev.off()
+
+```
+### C. Final DimPlots and Barplot
+```{r load_seurat_plots}
+# make dimplot of final clustering of all samples
+pdf(paste0(output.path,"final_DimPlot_after_annotation.pdf"));
+DimPlot(seurat,cols=cluster_colors)+
+  ggtitle(paste0(ifelse(repertoire=="T", "T", "B"), 
+                 " cell clusters in sc", str_to_upper(type), 
+                 " (n = ", nrow(seurat@meta.data), ")")) &NoAxes()
+dev.off()
+
+pdf(paste0(output.path,"final_DimPlot_after_annotation_labeled.pdf"));
+DimPlot(seurat,cols=cluster_colors,label= TRUE,repel= TRUE)+
+  ggtitle(paste0(ifelse(repertoire=="T", "T", "B"), 
+                 " cell clusters in sc", str_to_upper(type), 
+                 " (n = ", nrow(seurat@meta.data), ")")) &NoAxes()
+dev.off()
+
+#make barplot and table
+cells.by.type.t.only <- table(Idents(seurat)) %>% as.data.frame() 
+ggplot(cells.by.type.t.only, aes(x = Var1,# Freq), 
+                          y = Freq, fill=Var1))+
+  geom_col()+  scale_fill_manual(values=cluster_colors)+
+  geom_text(aes(label = Freq), hjust =-.2, vjust=0, angle=90)+
+  coord_cartesian(clip = 'off')+
+  theme_classic()+
+  theme(legend.title = element_blank(),
+        axis.text.x = element_text(angle=45, hjust=1,vjust=1),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        strip.background =  element_blank()#,panel.border = element_rect(colour = "black", fill = NA)
+        )+
+  theme(legend.position="null")+ggtitle("")+xlab("")+ylab("Cell count")+
+#coord_flip(clip="off")+ 
+  theme(plot.margin = unit(c(1,2,1,1), "lines"))
+
+ggsave(paste0(output.path,"final_summary_cellct_asbarplot.pdf"), width=5, height=7)
+  
+cells.by.type.t.only %>% 
+  bind_rows(summarise_all(., ~if(is.numeric(.)) {sum(.)} else "Total")) %>% 
+  write.csv(.,paste0(output.path, "final_summary_all_T_only.csv"), row.names = FALSE)
+
+cells.by.type.t.only %>% 
+  bind_rows(summarise_all(., ~if(is.numeric(.)) {sum(.)} else "Total")) %>% 
+  kbl(caption = "Summary of all cell types (after subsetting for T cells, low counts not removed)", align = 'c') %>%
+  kable_classic(full_width= FALSE) %>% 
+  save_kable(., paste0(output.path, "final_summary_all_T_only.pdf"))
+
+#DimPlot by patient
+pdf("output/final_DimPlot_after_annotation.pdf_bypatient_bysample.pdf",
+    width = 12, height = 8)
+DimPlot(seurat, cols=cluster_colors, split.by = 'Patient', ncol=2)+
+  ggprism::theme_prism()&NoAxes()
+DimPlot(seurat, cols=cluster_colors, split.by = 'orig.ident', ncol=2)+
+  ggprism::theme_prism()&NoAxes()
+dev.off()
+
+df <- seurat@meta.data %>% select(Patient, active.ident) %>% group_by(Patient, active.ident) %>% summarise(activeIdent_n=n()) %>% ungroup() #%>% bind_rows(summarise_all(., ~if(is.numeric(.)) {sum(.)} else "Total"))
+ggplot(df, aes(fill = Patient, x=reorder(active.ident, desc(activeIdent_n)), y=activeIdent_n))+
+  geom_bar(position="stack",stat="identity")+
+theme_classic()+
+  theme(legend.title = element_blank(),
+        axis.text.x = element_text(angle=45, hjust=1,vjust=1),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        strip.background =  element_blank()#,panel.border = element_rect(colour = "black", fill = NA)
+        )+
+   scale_fill_manual(values=c(
+                "Pt_#8" = "red", 
+                "Pt_#7" = "darkblue",
+                "Pt_#6" = "darkgreen"
+  )
+                    )+
+  ggtitle("Single cells per cluster, by patient")+xlab("")+ylab("Cell count")
+ggsave(paste0(output.path,"final_summary_all_T_only.pdf_byPatient.pdf"), width=5, height=7)
+```
+### D. Feature plots, ridgePlots, vlnPlots, DotPlots
+```{r other_seurat_plots}
+#make list of FeaturePlots for each GOI
+FeaturePlot.goi <- lapply(1:length(goi.all.list), function(i) {
+  FeaturePlot(seurat, features = goi.all.list[[i]], ncol=3, combine= TRUE)  +
+    plot_annotation(title=names(goi.all.list)[i]) &
+    theme(plot.title=element_text(size=12, face="bold")) & 
+    NoLegend()
+})
+
+pdf(paste0(output.path, 
+           "final_featureplots.pdf"), width = 12, height = 8)    
+for (i in 1:length(FeaturePlot.goi)) {
+  plot(FeaturePlot.goi[[i]]) 
+  } 
+dev.off()
+
+#make list of violin plots for each GOI
+vlnPlot.goi <- lapply(1:length(goi.all.list), function(i) {
+  VlnPlot(seurat, features = goi.all.list[[i]],cols=cluster_colors,stack= TRUE,flip= TRUE,fill.by='ident')
+})
+
+pdf(paste0(output.path, 
+           "final_vlnPlots.pdf"), width = 12, height = 8)    
+for (i in 1:length(vlnPlot.goi)) {
+  plot(vlnPlot.goi[[i]]) 
+  } 
+dev.off()
+
+#make list of DotPlots for each GOI
+DotPlot.goi <- lapply(1:length(goi.all.list), function(i) {
+  DotPlot(seurat, features = goi.all.list[[i]]) +
+    RotatedAxis()
+})
+
+pdf(paste0(output.path, 
+           "final_dotplots.pdf"), width = 12, height = 8)    
+for (i in 1:length(DotPlot.goi)) {
+  plot(DotPlot.goi[[i]]) 
+  } 
+dev.off()
+
+########################
+goi.for.pub  <- c("CD3G", 
+                  "CD8A",  
+                  "CCL5",   
+                  "CD69", 
+                  "NKG7","LCK", "IFNG", 
+                  "CD27", "PDCD1", "TIGIT")
+  
+#violin plots for specific markers for publication
+p1 <- VlnPlot(seurat, cols=cluster_colors,
+        features=goi.for.pub,stack= TRUE,flip= TRUE,fill.by='ident',pt.size=1)&NoLegend()
+p1
+pdf(paste0(output.path,"final_vlnPlots_goi_for_pub.pdf"),height=10,width=8);p1;dev.off()
+
+p2 <- DotPlot(seurat, features = goi.for.pub)+scale_x_discrete(limits = rev)+coord_flip()+theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1))
+p2+theme(axis.text.x = element_text(angle=45,hjust=1,vjust=1))
+pdf(paste0(output.path,"final_DotPlot_goi_for_pub.pdf"),height=10,width=8);p2;dev.off()
+
+p3 <- FeaturePlot(seurat,features=goi.for.pub,keep.scale="all",ncol=2)+
+  plot_layout(guides="collect")+
+  theme(
+    panel.spacing = unit(0,'lines')
+  )&
+  NoAxes()
+p3
+
+pdf(paste0(output.path,"final_FeaturePlot_goi_for_pub.pdf"),height=12,width=8);p3;dev.off()
+
+```
+### E. Clonal expansion on UMAP
+```{r clonalExp}
+# cloneType_col = pals::brewer.set1(n=length(levels(seurat@meta.data$cloneType)))
+cloneType_col <- scales::hue_pal()(length(levels(seurat@meta.data$cloneType)))
+names(cloneType_col) <- levels(seurat@meta.data$cloneType)
+cloneType_col
+cloneType_col %>% pal.bands()
+
+#change CD8 TEM color to black
+cloneType_col["Hyperexpanded (100 < X <= 500)"] <- "red"
+cloneType_col["Large (20 < X <= 100)"] <- "black"
+cloneType_col %>% pal.bands()
+
+pdf(paste0(output.path, "final_clonalExp.pdf"), width=10, height=9)
+DimPlot(seurat, group.by = "cloneType", cols = cloneType_col)+ ggtitle("")+
+    theme(legend.position = "right")&NoAxes()
+DimPlot(seurat, group.by = "cloneType", split.by="Patient", ncol=2, cols = cloneType_col)+ ggtitle("")+
+    theme(legend.position = "right")&NoAxes()
+DimPlot(seurat, group.by = "cloneType", split.by="orig.ident", ncol=2, cols = cloneType_col)+ ggtitle("")+
+    theme(legend.position = "right")&NoAxes()
+dev.off()
+
+seurat@meta.data %>% View
+
+#do fisher's exact test for association between CD8 and clonal expansion
+#CD8 TEM vs non-CD8 TEM, expanded (defined as clone count >5) vs non expanded (clone count 1-5)
+fisher.df = select(seurat@meta.data, c(Patient, Frequency, hasTCR, active.ident,cloneType)) %>% 
+  #subset for only the cells with a TCR
+  filter(hasTCR=="Yes") %>%
+  # create expansion column, which is binary categorical variable where expanded = frequency > 5 and nonexpanded = frequency 1-5
+  mutate(expansion = case_when(Frequency > 5 ~ "Expanded", 
+
+                               .default= "Non-Expanded"))  
+fisher.df
+OR_table = c()
+for (i in unique(fisher.df$active.ident)) {  
+    # create simplified cluster column 
+  temp <- fisher.df %>% mutate(binary = case_when(active.ident == i# %in% c("CD8 TEM"#, "CD8 TEM", "CD8 Proliferating"
+                                                 ~ i,
+                                                 .default=paste0("Non-", i)))#CD8"))
+  test <- table(temp$binary, temp$expansion) %>% fisher.test
+  #return odds ratio
+  OR_table = c(OR_table, c(i, 
+                           ifelse(test$p.value < 0.001, "< 0.001",
+                                  round(test$p.value, 3)),
+                           round(as.numeric(test$estimate),2),
+                           round(test$conf.int,2)
+                           ))
+
+}
+OR_table = as.data.frame(matrix(OR_table,ncol =5,byrow = T)) 
+colnames(OR_table) <- c("Cluster", "p-value","OR", "95%_CI_Lower","95%_CI_Upper")
+OR_table = arrange(OR_table,desc(OR))
+OR_table
+write.csv(OR_table, paste0(output.path, "fisher_exact_test_clonal_expansion_greater_than_5_clones_by_cluster.csv"), row.names = F)
+
+fisher.df.bypatient = select(seurat@meta.data, c(Patient, Frequency, hasTCR, active.ident,cloneType)) %>% 
+  #subset for only the cells with a TCR
+  filter(hasTCR=="Yes") %>%
+  # create expansion column, which is binary categorical variable where expanded = frequency > 5 and nonexpanded = frequency 1-5
+  mutate(expansion = case_when(Frequency > 5 ~ "Expanded", 
+
+                               .default= "Non-Expanded"))  %>% 
+  split(., f=.$Patient)
+
+lapply(1:length(fisher.df.bypatient),function(x) { 
+  fisher.df = fisher.df.bypatient[[x]]
+  OR_table = c()
+  for (i in unique(fisher.df$active.ident)) {  
+    # create simplified cluster column 
+  temp <- fisher.df %>% mutate(binary = case_when(active.ident == i# %in% c("CD8 TEM"#, "CD8 TEM", "CD8 Proliferating"
+                                                 ~ i,
+                                                 .default=paste0("Non-", i)))#CD8"))
+  test <- table(temp$binary, temp$expansion) %>% fisher.test
+  #return odds ratio
+  OR_table = c(OR_table, c(i, 
+                           ifelse(test$p.value < 0.001, "< 0.001",round(test$p.value, 3)),
+                           round(as.numeric(test$estimate),2),
+                           round(test$conf.int,2)
+                           ))
+  }
+  OR_table = as.data.frame(matrix(OR_table,ncol =5,byrow = T)) 
+  colnames(OR_table) <- c("Cluster", "p-value","OR", "95%_CI_Lower","95%_CI_Upper")
+  OR_table$OR <- as.numeric(as.character(OR_table$OR))
+  OR_table = arrange(OR_table,desc(OR))
+  return(OR_table)
+}) %>% 
+  `names<-`(.,names(fisher.df.bypatient)) %>% 
+  writexl::write_xlsx(., paste0(output.path, "fisher_exact_test_clonal_expansion_greater_than_5_clones_by_cluster_byPatient.xlsx"))
+```
+### F. Visualize clonally expanded TCRs
+```{r map_clonotypes}
+#create object seurat.expanded, which is a subset of seurat metadata that contains only cells with tcrs matching clonal expansion in TCRseq of pre-post pbmc (clones >=1)
+seurat.expanded <- seurat@meta.data %>% filter(expanded.post.vaccine==1)
+
+#create 2 lists with the suffix .bypatient, which are seurat.expanded and seurat.expanded.excludeSingletons split by orig.ident
+
+################# by sample
+seurat.expanded.orig.ident <- split(seurat.expanded, f=seurat.expanded$orig.ident)
+cells.of.interest = lapply(seurat.expanded.orig.ident,rownames)
+
+pdf("output/final_seurat_after_TCR_andAdaptive_adaptiveonUMAP_bysample.pdf", width=12,height=8)
+DimPlot(seurat, cols=cluster_colors,label= FALSE) + theme(legend.position = "bottom") +
+  DimPlot(seurat, cells.highlight = cells.of.interest, cols.highlight=c("red", "darkblue", "purple", "darkgreen"), split.by = "orig.ident",ncol=2)&NoAxes()
+DimPlot(seurat, cols=cluster_colors,label= FALSE) + theme(legend.position = "bottom") +    DimPlot(seurat, cells.highlight = cells.of.interest, cols.highlight=c("red", "darkblue", "purple", "darkgreen"))&NoAxes()
+dev.off()
+
+pdf("output/final_seurat_after_TCR_andAdaptive_adaptiveonUMAP_bysample_2.pdf")
+  DimPlot(seurat, cells.highlight = cells.of.interest, cols.highlight=c("red", "darkblue", "purple", "darkgreen"), split.by = "orig.ident",ncol=2)&NoAxes()
+  DimPlot(seurat, cells.highlight = cells.of.interest, cols.highlight=c("red", "darkblue", "purple", "darkgreen"))&NoAxes()
+
+dev.off()
+################## by patient
+seurat.expanded.bypatient <- split(seurat.expanded, f=seurat.expanded$Patient)
+cells.of.interest.bypatient = lapply(seurat.expanded.bypatient,rownames)
+
+pdf("output/final_seurat_after_TCR_andAdaptive_adaptiveonUMAP_byPatient.pdf", width=12,height=8)
+DimPlot(seurat,cols=cluster_colors,label= FALSE) + theme(legend.position = "bottom") +
+  DimPlot(seurat, cells.highlight = cells.of.interest.bypatient, cols.highlight=c("red", "darkblue","darkgreen"), split.by = "Patient",ncol=2)&NoAxes()
+DimPlot(seurat, cols=cluster_colors,label= FALSE) + theme(legend.position = "bottom") +
+  DimPlot(seurat, cells.highlight = cells.of.interest.bypatient, cols.highlight=c("red", "darkblue","darkgreen"),ncol=2)&NoAxes()
+dev.off()
+
+pdf("output/final_seurat_after_TCR_andAdaptive_adaptiveonUMAP_byPatient_2.pdf")
+  DimPlot(seurat, cells.highlight = cells.of.interest.bypatient, cols.highlight=c("red", "darkblue","darkgreen"), split.by = "Patient",ncol=2)&NoAxes()
+  DimPlot(seurat, cells.highlight = cells.of.interest.bypatient, cols.highlight=c("red", "darkblue","darkgreen"),ncol=2)&NoAxes()
+dev.off()
+
+seurat@meta.data %>% group_by(orig.ident) %>% 
+  summarise(n_cells_expanded.post.vaccine = sum(expanded.post.vaccine)) %>%  
+  bind_rows(summarise_all(., ~if(is.numeric(.)) {sum(.)} else "Total")) %>% 
+  kbl(caption = "Single cells with TCR expanded in Adaptive Bulk Data", align = 'c') %>%
+  kable_classic(full_width= FALSE) %>%
+  save_kable(., paste0(output.path, "final_summary_cells_with_without_TCR_expandedInAdaptive.pdf"))
+
+#create table showing single cell phenotypes of cells with expanded tcrs
+table <- seurat@meta.data %>% group_by(active.ident,expanded.post.vaccine) %>% 
+  summarise(n_cells_expanded.post.vaccine = sum(expanded.post.vaccine)) %>% 
+            # n_unique_cdr3aa_expanded.post.vaccine = n_distinct(CTaa)) %>%  
+  ungroup() %>% 
+  # arrange(desc(n_cells_expanded.post.vaccine)) %>% 
+  filter(expanded.post.vaccine==1) %>% select(-expanded.post.vaccine) %>% 
+  mutate(pct = round(100 * n_cells_expanded.post.vaccine/sum(n_cells_expanded.post.vaccine), digits=2)) %>% 
+  bind_rows(summarise_all(., ~if(is.numeric(.)) {sum(.)} else "Total")) 
+table
+
+write.csv(table, paste0(output.path, "final_summary_cells_with_without_TCR_expandedInAdaptive_byCluster_table.csv"),row.names= FALSE)
+table %>% 
+  kbl(caption = "Single cells with TCR expanded in Adaptive Bulk Data, by cluster", align = 'c') %>%
+  kable_classic(full_width= FALSE) %>%
+  save_kable(., paste0(output.path, "final_summary_cells_with_without_TCR_expandedInAdaptive_byCluster.pdf"))
+
+table.expanded.post.vaccine <- seurat@meta.data[seurat@meta.data$expanded.post.vaccine==1,]
+
+tcr_by_patient_by_activeident <- table(table.expanded.post.vaccine$Patient,
+                                       table.expanded.post.vaccine$active.ident) %>%
+  as.data.frame.matrix()  %>% rownames_to_column("Patient") %>%
+  mutate(total = rowSums(across(where(is.numeric)))) %>% 
+  bind_rows(summarise(., across(where(is.numeric), sum),
+                         across(where(is.character), ~'Total'))) %>% 
+  mutate(across(!Patient & !total, ~ paste0(.x, " (",round(100*.x/total,digits=2),"%)"))) 
+
+tcr_by_patient_by_activeident
+tcr_by_patient_by_activeident %>% 
+  write.csv(., paste0(output.path, "final_summary_cells_with_TCR_expandedInAdaptive_byPatient_table.csv"),row.names= F)
+
+tcr_by_patient_by_activeident_CD8 <- table(table.expanded.post.vaccine$Patient,
+                                       table.expanded.post.vaccine$active.ident) %>%
+  as.data.frame.matrix()  
+tcr_by_patient_by_activeident_CD8 = tcr_by_patient_by_activeident_CD8[grepl("CD8",names(tcr_by_patient_by_activeident_CD8))] %>% rownames_to_column("Patient") %>%
+  mutate(total = rowSums(across(where(is.numeric)))) %>% 
+   bind_rows(summarise(., across(where(is.numeric), sum),
+                         across(where(is.character), ~'Total'))) %>% 
+  mutate(across(!Patient & !total, ~ paste0(.x, " (",round(100*.x/total,digits=2),")")))
+
+tcr_by_patient_by_activeident_CD8
+tcr_by_patient_by_activeident_CD8  %>% 
+  write.csv(., paste0(output.path, "final_summary_cells_with_TCR_expandedInAdaptive_byPatient_table_CD8.csv"),row.names= F)
+
+  # do fisher's exact test on n_cells_expanded.post.vaccine: 
+# CD8 vs non-other
+fisher.df = select(seurat@meta.data, c(Patient, hasTCR, active.ident,expanded.post.vaccine)) %>% 
+  #subset for only the cells with a TCR
+  filter(hasTCR=="Yes") 
+nrow(fisher.df)
+fisher.df$expanded.post.vaccine <- factor(fisher.df$expanded.post.vaccine, levels=c(1,0), labels=c("Vaccine expanded","Non-vaccine expanded"))
+
+fisher.df
+OR_table = c()
+for (i in unique(fisher.df$active.ident)) {  
+    # create simplified cluster column 
+  temp <- fisher.df %>% mutate(binary = case_when(active.ident == i# %in% c("CD8 TEM"#, "CD8 TEM", "CD8 Proliferating"
+                                                 ~ i,
+                                                 .default=paste0("Non-", i)))#CD8"))
+# table(fisher.df$active.ident, fisher.df$expansion)
+  dat <- table(temp$expanded.post.vaccine,temp$binary)# 
+  test <- fisher.test(dat)
+  #return odds ratio
+  OR_table = c(OR_table, c(i, 
+                           ifelse(test$p.value < 0.001, "< 0.001",
+                                  round(test$p.value, 3)),
+                           round(as.numeric(test$estimate),2),
+                           round(test$conf.int,2)
+                           ))
+}
+OR_table = as.data.frame(matrix(OR_table,ncol =5,byrow = T)) 
+colnames(OR_table) <- c("Cluster", "p-value","OR", "95%_CI_Lower","95%_CI_Upper")
+OR_table$OR <- as.numeric(as.character(OR_table$OR))
+OR_table = arrange(OR_table,desc(OR))
+OR_table
+write.csv(OR_table, paste0(output.path, "fisher_exact_test_vaccine_expansion_vs_cluster.csv"), row.names = F)
+
+pdf("output/final_seurat_after_TCR_andAdaptive_expanded_TCRs_breakdownByCluster.pdf")
+df <- seurat@meta.data %>% group_by(Patient,active.ident) %>% 
+  summarise(n_cells_expanded.post.vaccine = sum(expanded.post.vaccine)) %>%  
+  arrange(desc(n_cells_expanded.post.vaccine)) %>%
+  #filter(n_cells_expanded.post.vaccine>0) %>% 
+  ungroup()
+ggplot(df,aes(x=active.ident, #reorder(active.ident,desc(n_cells_expanded.post.vaccine)),
+              y=n_cells_expanded.post.vaccine, fill=active.ident))+
+  geom_bar(stat="identity")+#+coord_flip()+
+  theme_classic()+
+  geom_text(aes(label=ifelse(n_cells_expanded.post.vaccine!=0,n_cells_expanded.post.vaccine,""),
+                hjust=+0.5,vjust=-0.1))+
+  scale_fill_manual(values=cluster_colors)+
+  xlab("Single cell identities of vaccine-expanded T cells")+ylab("n cells expanded post-vaccine")+
+  facet_wrap(~Patient,ncol=1, scales="free_y")+
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.text.x = element_text(angle=45,hjust=1,vjust=1),
+        strip.background =  element_blank(),
+        panel.border = element_rect(colour = "black", fill = NA))+
+    ggtitle("")
+
+ggplot(df,aes(x=Patient, y=n_cells_expanded.post.vaccine,fill=active.ident))+
+  geom_bar(stat="identity",position="fill", color="white", lwd=0.2, width=0.65)+
+  theme_classic()+ylab("Proportion of matched TCRs in single cell (%)")+xlab("")+
+  scale_fill_manual(values=cluster_colors)+
+    theme(legend.title = element_blank(),
+          axis.text.x = element_text(angle=45,hjust=1,vjust=1))+
+    ggtitle("")
+
+ggplot(df,aes(x=Patient, y=n_cells_expanded.post.vaccine,fill=active.ident))+
+  geom_bar(stat="identity",position="stack", color="white")+
+  theme_classic()+
+  scale_fill_manual(values=cluster_colors)+
+  ggtitle("")
+
+df <- df %>% group_by(Patient) %>% mutate(prop = round(100*(n_cells_expanded.post.vaccine/
+                                                  sum(n_cells_expanded.post.vaccine)),digits=2
+))
+  ggplot(df,aes(x="", y=prop,fill=active.ident))+
+  geom_bar(stat="identity", width=2,color="white")+
+  theme_void()+ylab("Proportion of matched TCRs in single cell (%)")+coord_polar("y",start=0)+
+  scale_fill_manual(values=cluster_colors)+facet_wrap(~Patient, ncol=2)+
+  ggtitle("")
+dev.off()
+
+pdf("output/final_seurat_after_TCR_andAdaptive_expanded_TCRs_breakdownByCluster_collapsed_2023-10-24.pdf")
+df_collapsed <- seurat@meta.data %>% group_by(active.ident) %>% 
+  summarise(n_cells_expanded.post.vaccine = sum(expanded.post.vaccine)) %>%  
+  arrange(desc(n_cells_expanded.post.vaccine)) %>%
+  #filter(n_cells_expanded.post.vaccine>0) %>% 
+  ungroup()
+ggplot(df_collapsed,aes(x=active.ident, #reorder(active.ident,desc(n_cells_expanded.post.vaccine)),
+              y=n_cells_expanded.post.vaccine, fill=active.ident))+
+  geom_bar(stat="identity")+#+coord_flip()+
+  theme_classic()+
+  geom_text(aes(label=ifelse(n_cells_expanded.post.vaccine!=0,n_cells_expanded.post.vaccine,""),
+                hjust=+0.5,vjust=-0.1))+
+  scale_fill_manual(values=cluster_colors)+
+  xlab("Single cell identities of vaccine-expanded T cells")+ylab("n cells expanded post-vaccine")+
+  # facet_wrap(~Patient,ncol=1, scales="free_y")+
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.text.x = element_text(angle=45,hjust=1,vjust=1),
+        strip.background =  element_blank(),
+        panel.border = element_rect(colour = "black", fill = NA))+
+    ggtitle("")
+
+ggplot(df_collapsed,aes(x=1,#Patient, 
+                        y=n_cells_expanded.post.vaccine,fill=active.ident))+
+  geom_bar(stat="identity",position="fill", color="white", lwd=0.2, width=0.65)+
+  theme_classic()+ylab("Vaccine expanded TCRB in single cell")+xlab("")+
+  scale_fill_manual(values=cluster_colors)+
+    theme(legend.title = element_blank(),
+          axis.text.x = element_text(angle=45,hjust=1,vjust=1))+
+    ggtitle("")+
+    scale_y_continuous(labels = scales::percent)+
+    xlab("")+theme(axis.text.x = element_blank(),axis.ticks.x = element_blank())
+
+ggplot(df_collapsed,aes(x=1,#Patient, 
+                        y=n_cells_expanded.post.vaccine,fill=active.ident))+
+  geom_bar(stat="identity",position="stack", color="white")+
+  theme_classic()+
+  scale_fill_manual(values=cluster_colors)+
+  ggtitle("")+
+  xlab("")+theme(axis.text.x = element_blank(),axis.ticks.x = element_blank())
+
+df_collapsed <- df_collapsed %>% #group_by(Patient) %>% 
+  mutate(prop = round(100*(n_cells_expanded.post.vaccine/
+                                                  sum(n_cells_expanded.post.vaccine)),digits=2
+))
+  ggplot(df_collapsed,aes(x="", y=prop,fill=active.ident))+
+  geom_bar(stat="identity", width=2,color="white")+
+  theme_void()+ylab("Proportion of matched TCRs in single cell (%)")+coord_polar("y",start=0)+
+  scale_fill_manual(values=cluster_colors)+#facet_wrap(~Patient, ncol=2)+
+  ggtitle("")
+dev.off()
+
+
+```
+### G. Occupied repertoire
+#### 1. occRepWrapper
+```{r occupiedRepertoire}
+#prep metadata for occcupiedscRepertoire function by creating $test column in metadata, which will be used for the figure legend of the occupied repertoire function
+#note this requires changing the $clonotype column in the metadata which will be appended with the prefix "Vaccine Expanded_" or "Non Vaccine Expanded_". This is then 'reset' at the conclusion of this code chunk
+
+occRepWrapper <- function(x, my_proportion) {
+  x$cloneType <- paste0(ifelse(x$expanded.post.vaccine==1, "Vaccine Expanded", "Non Vaccine Expanded"), 
+                           "_", 
+                           x$cloneType)
+  x@meta.data$cloneType <- factor(x@meta.data$cloneType, levels = c(
+  "Vaccine Expanded_Hyperexpanded (100 < X <= 500)",
+  "Vaccine Expanded_Large (20 < X <= 100)",
+  "Vaccine Expanded_Medium (5 < X <= 20)",
+  "Vaccine Expanded_Small (1 < X <= 5)",
+  "Vaccine Expanded_Single (0 < X <= 1)",
+  "Non Vaccine Expanded_Hyperexpanded (100 < X <= 500)",
+  "Non Vaccine Expanded_Large (20 < X <= 100)",
+  "Non Vaccine Expanded_Medium (5 < X <= 20)",
+  "Non Vaccine Expanded_Small (1 < X <= 5)",
+  "Non Vaccine Expanded_Single (0 < X <= 1)", NA))
+
+  clonetype_col <- c(brewer.pal(6, "GnBu")[6:2], brewer.pal(6, "OrRd")[c(6:2)])
+  names(clonetype_col) <- levels(x@meta.data$cloneType)
+  p1 <- occupiedscRepertoire(x, label= FALSE, x.axis = "ident", proportion=my_proportion) + 
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+    theme(legend.title=element_blank(),legend.position="right")
+  set_palette(p1, clonetype_col)
+}
+
+pdf(paste0(output.path, "final_occRep.pdf"))
+
+occRep_output <-occupiedscRepertoire(seurat, label= FALSE, x.axis="ident", proportion= TRUE)+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  theme(legend.title=element_blank(),legend.position="right")
+set_palette(occRep_output, pals::brewer.spectral(5))
+
+occRep_output2 <-occupiedscRepertoire(seurat, label= FALSE, x.axis="ident", proportion= FALSE)+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  theme(legend.title=element_blank(),legend.position="right")
+set_palette(occRep_output2, pals::brewer.spectral(5))
+
+occRepWrapper(seurat, T)
+occRepWrapper(seurat, F)
+
+#make plot of occRep by patient (single patient plots, assembled as patchwork)
+if (length(unique(seurat$Patient))>1) {
+  occRep.by.patient <- lapply(1:length(unique(seurat$Patient)), function(i) {
+    temp <- subset(x = seurat, subset = Patient == unique(seurat$Patient)[i])
+    occRepWrapper(temp, T)+ggtitle(unique(seurat$Patient)[i])
+  })
+  patchwork::wrap_plots(occRep.by.patient, guides="collect") & theme(legend.position = "none")
+} 
+dev.off()
+```
+#### 2. Alternate occRep
+```{r}
+summary_by_cluster <- seurat@meta.data[seurat@meta.data$hasTCR=="Yes",] %>% 
+  group_by(active.ident,expanded.post.vaccine) %>% summarise(n=n()) %>% ungroup() %>% 
+  group_by(active.ident) %>% mutate(total = sum(n)) %>% 
+  mutate(pct = (n/total) * 100)
+summary_by_cluster$pct=signif(summary_by_cluster$pct,2)
+summary_by_cluster$n_pct = paste0(summary_by_cluster$n," \n (",summary_by_cluster$pct,"%)")
+
+summary_by_cluster$expanded.post.vaccine = factor(summary_by_cluster$expanded.post.vaccine, levels=c(1,0), label=c("Yes", "No")) 
+
+summary_by_cluster
+
+pdf(paste0(output.path,"final_occRep_alternate.pdf"))
+ggplot(summary_by_cluster,aes(x=active.ident, y= n, fill=expanded.post.vaccine,label=n))+
+  geom_bar(stat="identity",position="stack")+
+  geom_text(size = 3, position = position_stack(vjust = 0.5))+
+  theme(axis.text.x = element_text(angle=45,hjust=1,vjust=1))+
+  ggtitle("Matched TCRs by single cell cluster")
+dev.off()
+```
+
+### H. make plots for 3 tcrs that were cloned
+```{r}
+#subset for Patient #8
+seurat_Pt_8 <- subset(seurat, subset = Patient=="Pt_#8")
+tcrbs <- c("CASSAIGTPSGEQFF", "CATTSGSPAGELFF","CAGRLAGASGELFF")
+
+pubnames_tcrbs = c("TCR1", "TCR2", "TCR3")  
+names(pubnames_tcrbs) = tcrbs
+
+#create dimplot with 3 tcrbs projected onto seurat_Pt_8
+TCR1_cells.of.interest = c(
+  rownames(seurat_Pt_8@meta.data[seurat_Pt_8@meta.data$TCRB_or_IGH%in%tcrbs[1],]),
+  rownames(seurat_Pt_8@meta.data[seurat_Pt_8@meta.data$TCRB_or_IGH2%in%tcrbs[1],])
+  )
+TCR2_cells.of.interest = c(
+  rownames(seurat_Pt_8@meta.data[seurat_Pt_8@meta.data$TCRB_or_IGH%in%tcrbs[2],]),
+  rownames(seurat_Pt_8@meta.data[seurat_Pt_8@meta.data$TCRB_or_IGH2%in%tcrbs[2],])
+  )
+TCR3_cells.of.interest = c(
+  rownames(seurat_Pt_8@meta.data[seurat_Pt_8@meta.data$TCRB_or_IGH%in%tcrbs[3],]),
+  rownames(seurat_Pt_8@meta.data[seurat_Pt_8@meta.data$TCRB_or_IGH2%in%tcrbs[3],])
+  )
+cells.of.interest = list(TCR1_cells.of.interest,
+                         TCR2_cells.of.interest,
+                         TCR3_cells.of.interest)
+names(cells.of.interest) = pubnames_tcrbs
+
+pdf("output/final_single_cell_identities_of_3_tcrb_on_umap.pdf")
+p_pt8<-DimPlot(seurat_Pt_8,
+        cells.highlight = cells.of.interest,
+        cols.highlight = c("darkgreen","darkblue","red")
+        )+scale_fill_discrete(breaks=c("TCR1","TCR2","TCR3"))&NoAxes()
+print(p_pt8)
+dev.off()
+
+df1 <- seurat_Pt_8@meta.data[seurat_Pt_8@meta.data$TCRB_or_IGH%in% tcrbs,] 
+nrow(df1) #224 cells have a match in the first tcrb column
+df2 <- seurat_Pt_8@meta.data[seurat_Pt_8@meta.data$TCRB_or_IGH2%in% tcrbs,] 
+nrow(df2) #1 cell has a match in the second tcrb column
+df <- bind_rows(df1, df2)
+
+#add combined column, which allows for definitive determination of barcodes corresponding to each tcrb
+df <- df %>% mutate (TCRB_or_IGH_combined = case_when(TCRB_or_IGH == "CASSAIGTPSGEQFF" ~ "CASSAIGTPSGEQFF", #should be n=191
+                                                TCRB_or_IGH == "CATTSGSPAGELFF" ~ "CATTSGSPAGELFF", #n=24
+                                                TCRB_or_IGH == "CAGRLAGASGELFF" | TCRB_or_IGH2 == "CAGRLAGASGELFF" ~ "CAGRLAGASGELFF")) #n=10
+df$TCRB_or_IGH_combined <- factor(df$TCRB_or_IGH_combined, levels=tcrbs) #add levels so tcrbs can be plotted from highest to lowest
+
+
+
+pdf("output/final_single_cell_identities_of_3_tcrb.pdf",height=10,width=6)
+p1<-ggplot(df, aes(x=TCRB_or_IGH_combined, fill=active.ident))+
+  geom_bar(stat="count", position="stack", lwd=0.5#,color="white"
+           )+
+  scale_fill_manual(values=cluster_colors)+
+  xlab("")+ylab("# single cells")+
+  ggtitle("")+
+ggprism::theme_prism()+
+  theme(legend.title = element_blank(),
+        axis.text.x = element_text(angle=45, hjust=1,vjust=1),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        strip.background =  element_blank()#,panel.border = element_rect(colour = "black", fill = NA)
+        )+
+  scale_x_discrete(labels=pubnames_tcrbs,limits=names(pubnames_tcrbs))
+print(p1)
+dev.off()
+
+pdf("output/final_single_cell_identities_of_3_tcrb_umap_plus_barplot.pdf",width=12, height=8)
+print(p_pt8+p1)
+dev.off()
+
+pdf("output/final_single_cell_identities_of_3_tcrb_horizontal_v1.pdf",height=6,width=10)
+ggplot(df, aes(x=TCRB_or_IGH_combined, fill=active.ident))+
+  geom_bar(stat="count", position="stack", lwd=0.5#,color="white"
+           )+  scale_fill_manual(values=cluster_colors)+
+  xlab("")+ylab("# single cells")+
+  ggtitle("")+
+ggprism::theme_prism()+
+  theme(legend.title = element_blank(),
+        axis.text.x = element_text(angle=45, hjust=1,vjust=1),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        strip.background =  element_blank()#,panel.border = element_rect(colour = "black", fill = NA)
+        )+
+    scale_x_discrete(labels=pubnames_tcrbs)+
+  coord_flip()
+
+dev.off()
+
+df$TCRB_or_IGH_combined <- factor(df$TCRB_or_IGH_combined, levels=rev(tcrbs)) #add levels so tcrbs can be plotted from highest to lowest
+
+pdf("output/final_single_cell_identities_of_3_tcrb_horizontal_v2.pdf",height=6,width=10)
+ggplot(df, aes(x=TCRB_or_IGH_combined, fill=active.ident))+
+  geom_bar(stat="count", position="stack", lwd=0.5#,color="white"
+           )+  scale_fill_manual(values=cluster_colors)+ 
+    xlab("")+ylab("# single cells")+
+  ggtitle("")+
+ggprism::theme_prism()+
+  theme(legend.title = element_blank(),
+        axis.text.x = element_text(angle=45, hjust=1,vjust=1),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        strip.background =  element_blank()#,panel.border = element_rect(colour = "black", fill = NA)
+        )+
+      scale_x_discrete(labels=pubnames_tcrbs)+
+  coord_flip()
+dev.off()
+
+
+
+
+df <- select(df, TCRB_or_IGH_combined, active.ident)
+gather(df, TCRB_or_IGH_combined, active.ident) %>% 
+  count(TCRB_or_IGH_combined, active.ident) %>% 
+  write.csv(., file=paste0(output.path, "final_single_cell_identities_of_3_tcrb_asTable1.csv"), row.names = FALSE)
+
+gather(df, TCRB_or_IGH_combined, active.ident) %>% 
+  count(TCRB_or_IGH_combined, active.ident) %>% 
+  spread(active.ident, n, fill=0) %>% 
+  write.csv(., file=paste0(output.path, "final_single_cell_identities_of_3_tcrb_asTable2.csv"),row.names= FALSE)
+```
+
+# VII. Session Info
+```{r sessioninfo}
+sessionInfo()
+writeLines(capture.output(sessionInfo()), "sessionInfo_2_analysis.txt")
+
+```
+

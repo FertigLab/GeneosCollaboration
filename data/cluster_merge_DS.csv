@@ -1,0 +1,36 @@
+old_id,new_id,level
+CD4 Naive,CD4 Naive,1
+CD4 Proliferating,CD4 Proliferating,9
+CD4 TCM_1,CD4 TCM_1,2
+CD4 TCM_2,CD4 TCM_2,3
+CD4 TCM_3,CD4 TCM_3,4
+CD4 TEM_1,CD4 TEM_1,5
+CD4 TEM_2,CD4 TEM_2,6
+CD4 TEM_3,CD4 TEM_3,7
+CD4 CTL,CD4 CTL,8
+CD8 Naive,CD8 Naive,10
+CD8 Naive_2,CD8 Naive_2,11
+CD8 Proliferating,CD8 Proliferating,20
+CD8 TCM_1,CD8 TCM_1,12
+CD8 TCM_2,CD8 TCM_2,13
+CD8 TEM_1,CD8 TEM_1,14
+CD8 TEM_2,CD8 TEM_2,15
+CD8 TEM_3,CD8 TEM_3,16
+CD8 TEM_4,CD8 TEM_4,17
+CD8 TEM_5,CD8 TEM_5,18
+CD8 TEM_6,CD8 TEM_6,19
+dnT_1,dnT,21
+dnT_2,dnT,21
+gdT_1,gdT,22
+gdT_2,gdT,22
+gdT_3,gdT,22
+gdT_4,gdT,22
+MAIT,MAIT,23
+NK Proliferating,NK Proliferating,24
+NK_1,NK_1,24
+NK_2,NK_2,24
+NK_3,NK_3,24
+NK_4,NK_4,24
+NK_CD56bright,NK_CD56bright,24
+Treg Memory,Treg,25
+Treg Naive,Treg,25
